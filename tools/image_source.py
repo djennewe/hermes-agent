@@ -39,6 +39,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote
 
 # Raw-bytes INGEST budget — what the resolver will load before handing off.
 # This is deliberately the 50MB download cap (tools/vision_tools._VISION_MAX_DOWNLOAD_BYTES),
@@ -119,7 +120,12 @@ async def resolve_image_source(
 
     # Everything else is a filesystem path — including bare relative names
     # like "pic.png" (accepted on main; a path-shape gate here regressed them).
-    candidate = s[len("file://"):] if s.lower().startswith("file://") else s
+    # A file:// URI percent-encodes reserved characters (e.g. a space as
+    # %20). Strip the scheme AND decode, or a path like
+    # "file:///.../Application%20Support/..." is looked up literally (with the
+    # %20) and never found. A bare filesystem path is passed through untouched
+    # so a literal '%' in a real path still works.
+    candidate = unquote(s[len("file://"):]) if s.lower().startswith("file://") else s
     p = Path(os.path.expanduser(candidate))
     # Confinement decision (see module docstring). Under a non-local backend
     # a path is host-readable ONLY if it lands in a media cache (after
