@@ -22,6 +22,18 @@ profile-aware directory under ``HERMES_HOME``). Each file looks like::
 The file's stem is treated as a fallback name when ``name:`` is absent, so
 dropping a YAML into the directory is enough to register a new bundle.
 
+Profile inheritance
+-------------------
+Bundles are user-level command aliases, so a profile session (where
+``HERMES_HOME`` is ``<root>/profiles/<name>``) searches its own
+``skill-bundles`` directory first and then the default root home's. A
+profile-defined bundle shadows a root bundle with the same slug. Bundle
+members resolve the same way: a member missing from the active home's
+skills tree is loaded from the root home instead, while the active home's
+disabled list stays authoritative. Writes (:func:`save_bundle` /
+:func:`delete_bundle`) always target the active home only, so a profile
+cannot mutate root-level bundles.
+
 Conflict resolution
 -------------------
 If a bundle and a skill share the same slash name, the bundle wins. The
@@ -50,7 +62,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -64,15 +76,40 @@ _bundles_cache_mtime: Optional[float] = None
 
 
 def _bundles_dir() -> Path:
-    """Return the canonical bundles directory under HERMES_HOME.
+    """Return the active (writable) bundles directory under HERMES_HOME.
 
     Honors ``HERMES_BUNDLES_DIR`` for tests; falls back to
-    ``<HERMES_HOME>/skill-bundles``.
+    ``<HERMES_HOME>/skill-bundles``. Writes always target this directory;
+    only discovery falls back to the root home (:func:`_bundles_search_dirs`).
     """
     override = os.environ.get("HERMES_BUNDLES_DIR")
     if override:
         return Path(override).expanduser()
     return get_hermes_home() / "skill-bundles"
+
+
+def _bundles_search_dirs() -> List[Path]:
+    """Return the ordered bundle search directories: active home, then root.
+
+    A profile session's HERMES_HOME is ``<root>/profiles/<name>``, which has
+    no bundles of its own unless the user created some; without the root
+    fallback every bundle command silently turns into "Unknown command" on
+    profile-hosted sessions (gateway ``slash.exec`` and Bot Mode chats).
+    Ordering is precedence: entries from the first directory shadow same-slug
+    entries from later ones. ``HERMES_BUNDLES_DIR`` stays an exclusive
+    override so tests remain hermetic.
+    """
+    override = os.environ.get("HERMES_BUNDLES_DIR")
+    if override:
+        return [Path(override).expanduser()]
+    active = get_hermes_home() / "skill-bundles"
+    root = get_default_hermes_root() / "skill-bundles"
+    try:
+        if root.resolve() == active.resolve():
+            return [active]
+    except OSError:
+        pass
+    return [active, root]
 
 
 def _slugify(name: str) -> str:
@@ -83,28 +120,29 @@ def _slugify(name: str) -> str:
 
 
 def _iter_bundle_files() -> List[Path]:
-    base = _bundles_dir()
-    if not base.exists():
-        return []
+    """Bundle YAMLs across the search dirs, active home's files first."""
     files: List[Path] = []
-    for ext in ("*.yaml", "*.yml"):
-        files.extend(sorted(base.glob(ext)))
+    for base in _bundles_search_dirs():
+        if not base.exists():
+            continue
+        for ext in ("*.yaml", "*.yml"):
+            files.extend(sorted(base.glob(ext)))
     return files
 
 
 def _max_mtime(files: List[Path]) -> float:
-    """Highest mtime across the bundle files plus the dir itself.
+    """Highest mtime across the bundle files plus the search dirs themselves.
 
-    Watching the directory mtime catches deletions; watching individual
+    Watching the directory mtimes catches deletions; watching individual
     files catches edits. Together they're a cheap freshness check.
     """
-    base = _bundles_dir()
     mtimes = []
-    if base.exists():
-        try:
-            mtimes.append(base.stat().st_mtime)
-        except OSError:
-            pass
+    for base in _bundles_search_dirs():
+        if base.exists():
+            try:
+                mtimes.append(base.stat().st_mtime)
+            except OSError:
+                pass
     for f in files:
         try:
             mtimes.append(f.stat().st_mtime)
@@ -169,8 +207,10 @@ def scan_bundles() -> Dict[str, Dict[str, Any]]:
     """Scan the bundles directory and rebuild the cache.
 
     Returns the same mapping as :func:`get_skill_bundles` — ``"/slug"`` →
-    bundle info dict. Later bundles with a duplicate slug are skipped with
-    a warning (first wins, alphabetical order).
+    bundle info dict. Later bundles with a duplicate slug are skipped
+    (first wins; active home before root home, alphabetical within a dir).
+    A within-directory duplicate warns; a cross-directory duplicate is the
+    documented shadowing behavior and is not logged.
     """
     global _bundles_cache, _bundles_cache_mtime
     files = _iter_bundle_files()
@@ -181,10 +221,11 @@ def scan_bundles() -> Dict[str, Dict[str, Any]]:
             continue
         key = f"/{info['slug']}"
         if key in out:
-            logger.warning(
-                "Duplicate bundle slug %s from %s; keeping %s",
-                key, f, out[key]["path"],
-            )
+            if Path(out[key]["path"]).parent == f.parent:
+                logger.warning(
+                    "Duplicate bundle slug %s from %s; keeping %s",
+                    key, f, out[key]["path"],
+                )
             continue
         out[key] = info
     _bundles_cache = out
@@ -301,6 +342,32 @@ def build_bundle_invocation_message(
     skills = info["skills"]
     extra_instruction = info.get("instruction") or ""
 
+    # Members missing from the active home fall back to the default root
+    # home, mirroring bundle discovery (see the module docstring): a profile
+    # session's scoped skills/ tree usually lacks the members of a
+    # root-defined bundle, and without the fallback the whole bundle dies
+    # with zero loadable skills. The active home stays authoritative: the
+    # fallback fires only when the active-home lookup misses, and the
+    # disabled gate above was already resolved against the active home.
+    fallback_home: Optional[Path] = None
+    try:
+        root_home = get_default_hermes_root()
+        if root_home.resolve() != get_hermes_home().resolve():
+            fallback_home = root_home
+    except OSError:
+        fallback_home = None
+
+    # Late import, like skill_commands above: this binds the override to the
+    # same hermes_constants module instance that tools.skills_tool reads at
+    # call time. A module-scope binding pins whichever instance existed at
+    # import, and a harness that re-imports the module tree (several test
+    # suites purge agent.*/tools.*/hermes_* from sys.modules) would then set
+    # the override on a ContextVar the skill lookup never consults.
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
     for skill_id in skills:
         identifier = (skill_id or "").strip()
         if not identifier or identifier in seen:
@@ -308,6 +375,12 @@ def build_bundle_invocation_message(
         seen.add(identifier)
 
         loaded = _load_skill_payload(identifier, task_id=task_id)
+        if not loaded and fallback_home is not None:
+            token = set_hermes_home_override(fallback_home)
+            try:
+                loaded = _load_skill_payload(identifier, task_id=task_id)
+            finally:
+                reset_hermes_home_override(token)
         if not loaded:
             missing.append(identifier)
             continue

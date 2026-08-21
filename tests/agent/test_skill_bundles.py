@@ -296,3 +296,129 @@ class TestListBundles:
         info_list = list_bundles()
         slugs = [b["slug"] for b in info_list]
         assert slugs == sorted(slugs)
+
+
+@pytest.fixture
+def profile_env(tmp_path, monkeypatch):
+    """Root home + profile home pair, HERMES_HOME bound to the profile.
+
+    Mirrors profile mode (``<root>/profiles/<name>``) so
+    ``get_default_hermes_root()`` resolves the root from the profile path.
+    No HERMES_BUNDLES_DIR override: these tests exercise the real
+    two-directory search order.
+    """
+    root = tmp_path / "hermes-root"
+    profile = root / "profiles" / "p1"
+    (root / "skill-bundles").mkdir(parents=True)
+    (root / "skills").mkdir(parents=True)
+    (profile / "skill-bundles").mkdir(parents=True)
+    (profile / "skills").mkdir(parents=True)
+    monkeypatch.delenv("HERMES_BUNDLES_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    # Some suites in this tree pop hermes_constants out of sys.modules
+    # mid-run (test_empty_tool_name_loop_dampening.py, test_save_url_image.py).
+    # After that, the hermes_constants instance the loader's home override
+    # writes to can differ from the instance tools.skills_tool reads through
+    # its import-time get_hermes_home binding, and the override becomes
+    # invisible to the skill scan. Production processes never re-import the
+    # module tree; re-align the reader with the current instance so these
+    # tests stay order-independent.
+    import hermes_constants
+    import tools.skills_tool as skills_tool_module
+    monkeypatch.setattr(
+        skills_tool_module, "get_hermes_home", hermes_constants.get_hermes_home
+    )
+    import agent.skill_bundles as mod
+    mod._bundles_cache = {}
+    mod._bundles_cache_mtime = None
+    return root, profile
+
+
+class TestProfileRootFallback:
+    """Profile sessions inherit bundles and their members from the root home.
+
+    Without the fallback, a profile-hosted session (gateway ``slash.exec``,
+    Bot Mode chats) sees zero bundles: ``/<bundle>`` degrades to
+    "Unknown command", and even a resolvable bundle loads zero members
+    because the profile's scoped skills tree lacks them.
+    """
+
+    def test_root_bundle_visible_from_profile_home(self, profile_env):
+        root, _profile = profile_env
+        _make_bundle_yaml(root / "skill-bundles", "shipit", ["alpha"])
+        assert "/shipit" in get_skill_bundles()
+        assert resolve_bundle_command_key("shipit") == "/shipit"
+
+    def test_profile_bundle_shadows_root_slug(self, profile_env):
+        root, profile = profile_env
+        _make_bundle_yaml(
+            root / "skill-bundles", "shipit", ["alpha"],
+            description="root version",
+        )
+        _make_bundle_yaml(
+            profile / "skill-bundles", "shipit", ["beta"],
+            description="profile version",
+        )
+        assert get_skill_bundles()["/shipit"]["description"] == "profile version"
+
+    def test_members_fall_back_to_root_skills(self, profile_env):
+        root, _profile = profile_env
+        _make_skill(root / "skills", "alpha", body="Root alpha body.")
+        _make_bundle_yaml(root / "skill-bundles", "shipit", ["alpha"])
+
+        result = build_bundle_invocation_message("/shipit", "go")
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["alpha"]
+        assert missing == []
+        assert "Root alpha body." in msg
+
+    def test_profile_member_shadows_root_member(self, profile_env):
+        root, profile = profile_env
+        _make_skill(root / "skills", "alpha", body="Root alpha body.")
+        _make_skill(profile / "skills", "alpha", body="Profile alpha body.")
+        _make_bundle_yaml(root / "skill-bundles", "shipit", ["alpha"])
+
+        result = build_bundle_invocation_message("/shipit", "go")
+        assert result is not None
+        msg, loaded, _missing = result
+        assert loaded == ["alpha"]
+        assert "Profile alpha body." in msg
+        assert "Root alpha body." not in msg
+
+    def test_active_home_disabled_list_gates_root_members(
+        self, profile_env, monkeypatch
+    ):
+        """The active home's disabled list stays authoritative for members
+        loaded from the root home: inheritance must not re-enable a skill
+        the profile disabled."""
+        root, _profile = profile_env
+        _make_skill(root / "skills", "alpha", body="ALPHA CONTENT.")
+        _make_skill(root / "skills", "beta", body="Beta content.")
+        _make_bundle_yaml(root / "skill-bundles", "shipit", ["alpha", "beta"])
+
+        import agent.skill_utils as su_module
+        monkeypatch.setattr(
+            su_module, "get_disabled_skill_names", lambda platform=None: {"alpha"}
+        )
+
+        result = build_bundle_invocation_message("/shipit", "")
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["beta"]
+        assert missing == []
+        assert "ALPHA CONTENT." not in msg
+
+    def test_rescan_when_root_bundle_added(self, profile_env):
+        root, _profile = profile_env
+        _make_bundle_yaml(root / "skill-bundles", "one", ["alpha"])
+        assert "/one" in get_skill_bundles()
+        _make_bundle_yaml(root / "skill-bundles", "two", ["beta"])
+        assert "/two" in get_skill_bundles()
+
+    def test_save_targets_active_home(self, profile_env):
+        """Writes stay profile-local: inheritance is read-only."""
+        root, profile = profile_env
+        path = save_bundle("mine", ["alpha"])
+        assert path.parent == profile / "skill-bundles"
+        assert not (root / "skill-bundles" / "mine.yaml").exists()
