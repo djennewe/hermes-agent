@@ -172,7 +172,11 @@ export interface GroupChat {
    *  `{ name }`, and the sweep re-validates the route before trusting one. */
   sessionOwners?: Record<string, Partial<RosterRow>>
   sessions?: Record<string, string | true>
-  stranded?: Record<string, number | { before: number; thread?: string }>
+  /** `tail` is the trailing-assistant baseline (see lastAssistantText):
+   *  reply detection that survives in-place context compression. Absent on
+   *  markers written before that fix, and null when the baseline snapshot
+   *  carried no message array — both keep the original count-only test. */
+  stranded?: Record<string, number | { before: number; tail?: null | string; thread?: string }>
   syncRevision?: number
   /** Left behind when a room is disbanded, so sync can't resurrect it. */
   tombstone?: boolean

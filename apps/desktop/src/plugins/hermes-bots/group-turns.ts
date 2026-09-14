@@ -43,6 +43,33 @@ interface GroupTurnTranscriptMessage {
  *  When only pass text exists in range, returns the newest (last
  *  chronological) one rather than the oldest. Returns null only when no
  *  assistant message appears in that range. */
+/** Trimmed text of the LAST assistant message in a transcript ('' when none).
+ *  The reply-detection baseline: a member's finished turn always leaves its
+ *  reply as the trailing assistant message, no matter what in-place context
+ *  compression did to the COUNT of everything before it. */
+function lastAssistantText(messages: GroupTurnTranscriptMessage[]): string {
+  if (!Array.isArray(messages)) {
+    return ''
+  }
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+
+    if (msg?.role === 'assistant') {
+      const text =
+        typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
+            : msg?.text || ''
+
+      return String(text).trim()
+    }
+  }
+
+  return ''
+}
+
 function pickGroupTurnReply(messages: GroupTurnTranscriptMessage[], before: number): null | string {
   let passText: null | string = null
 
@@ -758,11 +785,12 @@ interface GroupTurnPollContext {
   liveRuntime: string
   runtimeIds: Set<string>
   before: number
+  beforeTail: null | string
   binding: { isLive(): boolean }
 }
 
 async function pollGroupMemberTurn(context: GroupTurnPollContext): Promise<null | string> {
-  const { member, thread, dispatchEpoch, stored, liveRuntime, runtimeIds, before, binding } = context
+  const { member, thread, dispatchEpoch, stored, liveRuntime, runtimeIds, before, beforeTail, binding } = context
   const memberKey = groupMemberKey(member)
   const started = Date.now()
   let deadline = started + GROUP_TURN_TIMEOUT_MS
@@ -821,8 +849,23 @@ async function pollGroupMemberTurn(context: GroupTurnPollContext): Promise<null 
     const awaitingUser = syncGroupClarify(context.group, member, state)
     const done = !busy && !awaitingUser
 
-    if (messages.length > before && done) {
-      const replyText = pickGroupTurnReply(messages, before)
+    // Count growth OR a changed trailing assistant message — the latter is what
+    // survives in-place compression shrinking the array under `before`. A null
+    // beforeTail means the baseline had no message array to compare against, so
+    // only the count test applies.
+    const grew = messages.length > before
+    const replied = grew || (beforeTail !== null && lastAssistantText(messages) !== beforeTail)
+
+    if (replied && done) {
+      // pickGroupTurnReply scans [before, end] and steps over synthetic passes
+      // to keep a substantive reply (8d412e67ba). That window is EMPTY in the
+      // case this patch exists for: in-place compression can leave the array
+      // SHORTER than `before`, so the scan finds nothing and the finished reply
+      // is dropped exactly as it was before the fix. When the tail test is what
+      // identified the reply, the trailing assistant message IS the reply, and
+      // scanning further back would re-deliver a pre-compression message as
+      // this turn's answer.
+      const replyText = grew ? pickGroupTurnReply(messages, before) : lastAssistantText(messages) || null
 
       if (replyText !== null) {
         recordGroupActivity(context.group, {
@@ -870,6 +913,7 @@ async function pollGroupMemberTurn(context: GroupTurnPollContext): Promise<null 
       ...(r.stranded || {}),
       [groupMemberKey(member)]: {
         before,
+        tail: beforeTail,
         thread
       }
     }
@@ -885,8 +929,15 @@ async function prepareGroupTurnBaseline(
   runtime: string,
   stored: GroupMemberSessionHandle['stored']
 ) {
-  // Baseline: how many messages exist before our submit.
+  // Baseline: how many messages exist before our submit, PLUS the trailing
+  // assistant text. The count alone is not compression-proof: preflight
+  // in-place compression at the member's turn start can shrink 513 messages to
+  // ~150, so `messages.length > before` never fires and the finished reply is
+  // read as a pass — the room shows "thinking" until timeout while the member's
+  // own session holds a complete answer. A changed trailing assistant message
+  // identifies the new reply regardless of count.
   let before = 0
+  let beforeTail: null | string = null
   // Every runtime id this turn has seen for the member's session. Terminal
   // frames are keyed by runtime id, and a resume can hand back a fresh one.
   const runtimeIds = new Set<string>([runtime])
@@ -898,6 +949,10 @@ async function prepareGroupTurnBaseline(
     })) as GroupSessionSnapshot
 
     before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
+    // Tail baseline only when a real message array came back: comparing against
+    // '' when the backend returned a bare message_count would read ANY
+    // pre-existing assistant history as a fresh reply.
+    beforeTail = Array.isArray(pre?.messages) ? lastAssistantText(pre.messages) : null
 
     if (pre?.session_id) {
       runtimeIds.add(pre.session_id)
@@ -906,7 +961,7 @@ async function prepareGroupTurnBaseline(
     /* lazy session — zero messages */
   }
 
-  return { before, runtimeIds }
+  return { before, beforeTail, runtimeIds }
 }
 
 async function runGroupChatMemberTurnLeased(
@@ -936,7 +991,7 @@ async function runGroupChatMemberTurnLeased(
       thread
     })
 
-    const { before, runtimeIds } = await prepareGroupTurnBaseline(member, runtime, stored)
+    const { before, beforeTail, runtimeIds } = await prepareGroupTurnBaseline(member, runtime, stored)
 
     const { failed, fileRefs } = await stageGroupTurnAttachments(member, runtime, images)
 
@@ -969,6 +1024,7 @@ async function runGroupChatMemberTurnLeased(
       liveRuntime,
       runtimeIds,
       before,
+      beforeTail,
       binding
     })
   } finally {
@@ -990,6 +1046,9 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
     const marker = room.stranded?.[memberKey]
     // Markers were a bare number before threads; normalize both shapes.
     const strandedBefore = typeof marker === 'number' ? marker : marker?.before
+    // Trailing-assistant baseline (compression-proof reply detection). Absent on
+    // markers written by older code — those keep the count-only test.
+    const strandedTail = typeof marker === 'object' ? marker?.tail : undefined
     const strandedThread = (typeof marker === 'object' && marker?.thread) || 'legacy'
 
     if (typeof strandedBefore !== 'number') {
@@ -1032,11 +1091,25 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
     })
     const messages = Array.isArray(state?.messages) ? state.messages : []
 
-    if (messages.length <= strandedBefore) {
+    // No new reply when the count has not grown AND the trailing assistant
+    // message is unchanged. In-place compression makes the count test alone read
+    // a finished reply as "nothing new" — and this path has already consumed the
+    // marker, so a false negative here dropped the reply for good. Markers
+    // without a usable tail baseline (older code's count-only markers, or a
+    // baseline that had no message array — tail null) keep the original test.
+    const tailUnchanged = strandedTail == null || lastAssistantText(messages) === strandedTail
+
+    if (messages.length <= strandedBefore && tailUnchanged) {
       return
     }
 
-    const reply = pickGroupTurnReply(messages, strandedBefore)
+    // Same empty-window trap as the round loop, and worse here: the marker was
+    // already consumed above, so a miss drops the reply permanently, which is the
+    // incident this patch was written from.
+    const reply =
+      messages.length > strandedBefore
+        ? pickGroupTurnReply(messages, strandedBefore)
+        : lastAssistantText(messages) || null
 
     if (reply && !isGroupPassText(reply)) {
       recordGroupActivity(group, {

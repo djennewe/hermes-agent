@@ -969,3 +969,39 @@ describe('stopGroupThread (#91868/#94569)', () => {
     expect(reply).toBe('finished anyway')
   })
 })
+
+// ── In-place compression vs the round loop ──────────────────────────────────
+// The room drove each member's turn off `messages.length > before`. Preflight
+// compression rewrites the session IN PLACE at turn start, leaving the array
+// SHORTER than the baseline, so a finished reply read as silence and the room
+// showed "thinking" until the 3-minute timeout.
+
+describe('in-place compression', () => {
+  it('surfaces the finished reply when a mid-turn compaction shrinks the transcript', async () => {
+    const room = await loadRoom({
+      turn: ({ n, session }) => {
+        if (n === 1) {
+          return 'first answer'
+        }
+
+        // Round 2: preflight in-place compression — drop everything before the
+        // just-submitted user prompt, then reply. The final array is SHORTER
+        // than the pre-submit baseline.
+        session.messages.splice(0, session.messages.length - 1)
+
+        return 'compressed-era answer'
+      }
+    })
+
+    const members: GroupMember[] = [{ name: 'research', title: '' }]
+
+    room.rounds.sendToGroupChat('Comp', members, 'question one')
+    await settle(room, 'Comp')
+
+    room.rounds.sendToGroupChat('Comp', members, 'question two')
+    await settle(room, 'Comp')
+
+    expect(log(room, 'Comp').some(entry => entry.text.includes('compressed-era answer'))).toBe(true)
+    expect(room.chat.$groupChats.get().Comp?.running).toBeFalsy()
+  })
+})
